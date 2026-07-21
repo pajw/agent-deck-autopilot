@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# agent-deck-housekeeping: scheduled deck hygiene.
+#
+#   1. Purge dead sessions (no tmux pane, idle DEAD_DAYS+) from the registry.
+#   2. Remove orphaned per-session state files in ~/.agent-deck/hooks.
+#   3. Send WRAP_COMMAND into live Claude sessions idle IDLE_DAYS+ (max
+#      WRAP_LIMIT per run, 'idle' status only; sessions sitting on a prompt
+#      or question are flagged, never typed into), then archive the ones
+#      that finish cleanly.
+#   4. Report the sweep via NOTIFY_CMD, or the log when none is configured.
+#
+# Configuration (optional): ~/.config/agent-deck-autopilot.conf, shell syntax.
+#   IDLE_DAYS (7)  DEAD_DAYS (14)  WRAP_LIMIT (3)  WRAP_TIMEOUT_MIN (25)
+#   WRAP_COMMAND (/wrap-up)   AGENTDECK_PROFILE (default)
+#   NOTIFY_CMD    command accepting --title/--text/--subtle, e.g. a webhook
+#                 poster. Unset: summary goes to the log only.
+# Env overrides for testing: TEST_WRAP_ID (force one session through the
+# wrap path), DRY_RUN (passed through to NOTIFY_CMD).
+set -uo pipefail
+
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+export AGENTDECK_SUPPRESS_TMUX_WARNING=1
+[ -f "$HOME/.config/agent-deck-autopilot.conf" ] && . "$HOME/.config/agent-deck-autopilot.conf"
+
+AD=$(command -v agent-deck || echo /opt/homebrew/bin/agent-deck)
+PROFILE=${AGENTDECK_PROFILE:-default}
+DB="$HOME/.agent-deck/profiles/$PROFILE/state.db"
+LOG="$HOME/Library/Logs/agent-deck-housekeeping.log"
+IDLE_DAYS=${IDLE_DAYS:-7}
+DEAD_DAYS=${DEAD_DAYS:-14}
+WRAP_LIMIT=${WRAP_LIMIT:-3}
+WRAP_TIMEOUT_MIN=${WRAP_TIMEOUT_MIN:-25}
+WRAP_COMMAND=${WRAP_COMMAND:-/wrap-up}
+NOTIFY_CMD=${NOTIFY_CMD:-}
+
+log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
+db()  { sqlite3 -separator '|' "file:$DB?mode=ro" "$1" 2>/dev/null; }
+
+[ -x "$AD" ] || { log "agent-deck binary missing, aborting"; exit 0; }
+[ -f "$DB" ] || { log "state db missing at $DB, aborting"; exit 0; }
+summary=""
+
+# --- 1. purge dead sessions ---------------------------------------------------
+dead=$("$AD" session cleanup --days "$DEAD_DAYS" --yes 2>&1 | tail -3 | tr '\n' ' ')
+log "cleanup(--days $DEAD_DAYS): $dead"
+summary+="Dead-session purge: ${dead:-nothing}\n"
+
+# --- 2. orphaned state files ----------------------------------------------------
+live_ids=$(db "select substr(id,1,8) from instances;")
+removed=0
+for f in "$HOME"/.agent-deck/hooks/*.json "$HOME"/.agent-deck/hooks/*.sid; do
+  [ -e "$f" ] || continue
+  prefix=$(basename "$f"); prefix=${prefix%%-*}
+  echo "$live_ids" | grep -q "^$prefix$" || { rm -f "$f"; removed=$((removed+1)); }
+done
+find "$HOME/.agent-deck" -maxdepth 1 -name 'debug-*.log.gz' -mtime +30 -delete 2>/dev/null
+log "orphan files removed: $removed"
+summary+="Orphaned state files removed: $removed\n"
+
+# --- 3. wrap-up sweep ------------------------------------------------------------
+cutoff=$(( $(date +%s) - IDLE_DAYS * 86400 ))
+if [ -n "${TEST_WRAP_ID:-}" ]; then
+  candidates=$(db "select substr(id,1,8), title, status, tmux_session from instances
+                   where id like '${TEST_WRAP_ID}%';")
+else
+  candidates=$(db "select substr(id,1,8), title, status, tmux_session from instances
+                   where archived_at = 0 and is_conductor = 0 and pin = ''
+                     and tool = 'claude'
+                     and status in ('idle','waiting')
+                     and last_accessed > 0 and last_accessed < $cutoff;")
+fi
+
+wrapped="" flagged="" wrap_count=0
+while IFS='|' read -r id title status tmux; do
+  [ -n "$id" ] || continue
+  tmux has-session -t "$tmux" 2>/dev/null || continue   # dead: cleanup's job
+  [ -n "${TEST_WRAP_ID:-}" ] && status=idle             # test override: force the wrap path
+  if [ "$status" = "waiting" ]; then
+    flagged+="• $title (waiting on input, idle ${IDLE_DAYS}d+)\n"
+    continue
+  fi
+  [ "$wrap_count" -lt "$WRAP_LIMIT" ] || { flagged+="• $title (idle, over wrap limit this run)\n"; continue; }
+  wrap_count=$((wrap_count+1))
+  log "sending $WRAP_COMMAND to $id ($title)"
+  msg="$WRAP_COMMAND automated stale-session sweep: this session has been idle ${IDLE_DAYS}+ days and will be archived after wrap-up. Proceed without asking questions; skip anything that needs my input and list it in the report instead."
+  if ! "$AD" session send "$id" "$msg" --defer-if-busy >/dev/null 2>&1; then
+    log "send failed for $id"; flagged+="• $title (wrap-up send failed)\n"; continue
+  fi
+  # 'waiting' = turn finished with unread output, so it only counts as done
+  # once we've seen the wrap-up actually running; 'idle' always counts.
+  end=$(( $(date +%s) + WRAP_TIMEOUT_MIN * 60 )); final="" seen_running=0
+  sleep 20
+  while [ "$(date +%s)" -lt "$end" ]; do
+    final=$(db "select status from instances where id like '${id}%';")
+    case "$final" in
+      running|starting) seen_running=1 ;;
+      idle|error) break ;;
+      waiting) [ "$seen_running" = 1 ] && break ;;
+    esac
+    sleep 30
+  done
+  if { [ "$final" = "idle" ] || [ "$final" = "waiting" ]; } && [ "$seen_running" = 1 ]; then
+    "$AD" session archive "$id" >/dev/null 2>&1
+    log "wrapped + archived $id ($title)"
+    wrapped+="• $title (report in transcript; unarchive to revisit)\n"
+  else
+    log "wrap-up did not settle for $id (status: ${final:-timeout}, seen_running=$seen_running)"
+    flagged+="• $title (wrap-up ended '${final:-timeout}', left un-archived)\n"
+  fi
+done <<< "$candidates"
+
+[ -n "$wrapped" ] && summary+="Wrapped up + archived:\n$wrapped"
+[ -n "$flagged" ] && summary+="Needs your attention:\n$flagged"
+[ -z "$wrapped$flagged" ] && summary+="No stale sessions to wrap.\n"
+
+# --- 4. notify --------------------------------------------------------------------
+total=$(db "select count(*) from instances where archived_at = 0;")
+body=$(printf "%b" "$summary")
+if [ -n "$NOTIFY_CMD" ] && command -v "$NOTIFY_CMD" >/dev/null 2>&1; then
+  "$NOTIFY_CMD" --title "🧹 Agent Deck weekly housekeeping" \
+    --text "$body" \
+    --subtle "$total active sessions remain • $(date '+%a %d %b %H:%M')" >> "$LOG" 2>&1
+else
+  log "summary: $body"
+fi
+log "done"

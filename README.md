@@ -8,7 +8,8 @@ Born of a deck with 35 sessions all called `learnamp-xx` in one group. Never aga
 
 **Auto-naming and auto-grouping** (`hooks/agentdeck-auto-rename.sh`): a Claude Code `UserPromptSubmit` hook. On each prompt inside an agent-deck session it:
 
-- renames the session to `KEY-123 <branch-slug>` when the prompt or git branch mentions a ticket, then locks the title so agent-deck's name sync can't overwrite it (upstream issue #697);
+- renames the session to `KEY-123 <what the ticket is about>` when the prompt or git branch mentions a ticket, then locks the title so agent-deck's name sync can't overwrite it (upstream issue #697). The description comes from `AGENTDECK_TICKET_TITLE_CMD`, a command of yours that turns a ticket key into its summary; without one it falls back to the branch slug. A key on its own tells you which work item a session belongs to and nothing about what it is doing, which is the entire problem with a deck full of `LA-39776`;
+- never overwrites a title you wrote yourself — only ones it wrote itself;
 - otherwise replaces path-derived titles (`myrepo-3f`) with the first words of the prompt;
 - classifies sessions still sitting in a default group using your configured keyword rules (first match wins), with an optional fallback group for ticketed work. Sessions you've grouped by hand are never moved.
 
@@ -17,6 +18,12 @@ Born of a deck with 35 sessions all called `learnamp-xx` in one group. Never aga
 This exists because wrap-up only fires on sessions that finish politely. A session whose tmux server goes away takes its context with it, and those are the ones you most want back. Writing the note continuously makes death free. Notes outlive the registry row on purpose: `grep` is the recovery path once a session is gone.
 
 It also runs standalone — `--all` to rebuild every note, `--relink` to recover a transcript whose `.sid` pointer was lost by matching project path and start time.
+
+**Naming the unticketed** (`bin/agent-deck-name-session`): a `Stop` hook that titles the sessions no ticket key can describe — spikes, investigations, one-offs — by asking a cheap model to read the standing note and name the work in a few words. `thingy` becomes `conversational jd-writer interface`.
+
+It runs once per session, after a few turns, and locks the result. A title that keeps changing is worse than a bad one, because you stop being able to find anything. `--dry-run` shows what it would do; `AGENTDECK_AUTONAME=0` turns it off.
+
+`--enrich-tickets` backfills ticket summaries onto sessions still titled with a bare key, so configuring `AGENTDECK_TICKET_TITLE_CMD` fixes the deck you already have rather than only the sessions you touch next.
 
 **Ranked triage** (`bin/agent-deck-rank`): scores stale sessions against evidence outside the deck — is the ticket still open, is there an open PR, are there unmerged commits, did it stop mid-answer, is the worktree still on disk. Prints `score, id, title, reasons`.
 

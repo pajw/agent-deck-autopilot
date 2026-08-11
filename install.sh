@@ -9,6 +9,7 @@ ln -sf "$REPO/hooks/agentdeck-auto-rename.sh" "$HOME/.claude/hooks/agentdeck-aut
 ln -sf "$REPO/bin/agent-deck-housekeeping" "$HOME/.local/bin/agent-deck-housekeeping"
 ln -sf "$REPO/bin/agent-deck-session-note" "$HOME/.local/bin/agent-deck-session-note"
 ln -sf "$REPO/bin/agent-deck-rank" "$HOME/.local/bin/agent-deck-rank"
+ln -sf "$REPO/bin/agent-deck-name-session" "$HOME/.local/bin/agent-deck-name-session"
 [ -f "$HOME/.config/agent-deck-autopilot.conf" ] || cp "$REPO/config.example.conf" "$HOME/.config/agent-deck-autopilot.conf"
 
 plist="$HOME/Library/LaunchAgents/com.agent-deck-autopilot.housekeeping.plist"
@@ -33,11 +34,16 @@ Done. Two manual steps remain:
      "async": true, "timeout": 20 }
 
    hooks.Stop — keeps its standing note current, so a session that dies
-   without a wrap-up still leaves a readable record:
+   without a wrap-up still leaves a readable record, then titles unticketed
+   sessions from that note. Order matters: the namer reads what the note
+   writes.
 
    { "type": "command",
      "command": "~/.local/bin/agent-deck-session-note",
-     "async": true, "timeout": 20 }
+     "async": true, "timeout": 20 },
+   { "type": "command",
+     "command": "~/.local/bin/agent-deck-name-session",
+     "async": true, "timeout": 150 }
 
 Dry-run the housekeeping any time, without touching a session:
 

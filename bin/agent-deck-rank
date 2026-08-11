@@ -217,8 +217,14 @@ def main():
             points, why = score(row)
         except Exception as exc:
             points, why = 0, f"scoring failed: {exc}"
-        scored.append((points, row["id"], row.get("title", ""), why))
-    for points, rid, title, why in sorted(scored, key=lambda s: -s[0]):
+        seen = max(int(row.get("last_accessed") or 0), int(row.get("created_at") or 0))
+        scored.append((points, seen, row["id"], row.get("title", ""), why))
+    # Ties are broken by most recently touched, then by id. Without that the
+    # order falls out of the database and which session survives a sweep
+    # becomes arbitrary, which is not a property you want in a tool that
+    # archives things.
+    scored.sort(key=lambda s: (-s[0], -s[1], s[2]))
+    for points, _seen, rid, title, why in scored:
         print(f"{points}\t{rid}\t{title}\t{why}")
     return 0
 

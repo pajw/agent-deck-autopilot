@@ -12,12 +12,23 @@ Born of a deck with 35 sessions all called `learnamp-xx` in one group. Never aga
 - otherwise replaces path-derived titles (`myrepo-3f`) with the first words of the prompt;
 - classifies sessions still sitting in a default group using your configured keyword rules (first match wins), with an optional fallback group for ticketed work. Sessions you've grouped by hand are never moved.
 
+**Standing session notes** (`bin/agent-deck-session-note`): a Claude Code `Stop` hook that rewrites a short markdown note after every assistant turn — what the session was opened for, the last exchange, the prompt trail, whether it stopped mid-answer.
+
+This exists because wrap-up only fires on sessions that finish politely. A session whose tmux server goes away takes its context with it, and those are the ones you most want back. Writing the note continuously makes death free. Notes outlive the registry row on purpose: `grep` is the recovery path once a session is gone.
+
+It also runs standalone — `--all` to rebuild every note, `--relink` to recover a transcript whose `.sid` pointer was lost by matching project path and start time.
+
+**Ranked triage** (`bin/agent-deck-rank`): scores stale sessions against evidence outside the deck — is the ticket still open, is there an open PR, are there unmerged commits, did it stop mid-answer, is the worktree still on disk. Prints `score, id, title, reasons`.
+
 **Scheduled housekeeping** (`bin/agent-deck-housekeeping`, weekly LaunchAgent):
 
-1. purges dead sessions (no tmux pane, idle 14+ days) from the registry; transcripts and worktrees are kept;
-2. removes orphaned per-session state files under `~/.agent-deck/hooks/`;
-3. sends a wrap-up command (default `/wrap-up`, assumed to exist as a skill or slash command in your Claude Code setup) into live sessions idle 7+ days, then archives the ones that complete. Capped per run, and only sessions in `idle` status are touched: a session in `waiting` may be sitting on a question or permission dialog, and typing into one is how accidents happen, so those are flagged to you instead;
-4. reports the sweep through any notifier command you configure, or the log otherwise.
+1. refreshes every session's note, so nothing is retired without a record;
+2. purges dead sessions (no tmux pane, idle 14+ days) from the registry, stamping each note with why it went; transcripts and worktrees are kept;
+3. moves orphaned per-session state files out of `~/.agent-deck/hooks/` into an archive rather than deleting them — a `.sid` file is the only link from a deck session to its transcript, and deleting it is how a transcript becomes unfindable;
+4. ranks the stale live sessions, keeps the top `RANK_KEEP` for you to decide on, and retires the rest: idle ones get a wrap-up command first (default `/wrap-up`, capped by `WRAP_LIMIT`), then everything below the line is archived. Sessions in `waiting` are archived but never typed into — one may be sitting on a permission dialog, and sending keys to it is how accidents happen;
+5. reports the few that need a decision through any notifier command you configure, or the log otherwise.
+
+The point of step 4 is that a weekly list of everything stale is an inventory, and an inventory that only grows gets skimmed. Set `ARCHIVE_UNRANKED=0` to get the old flag-everything behaviour back.
 
 ## Install
 
@@ -33,16 +44,19 @@ Requires agent-deck v1.10+ (for `session set-title-lock` and `session cleanup`),
 ## Safety notes
 
 - The housekeeping script reads agent-deck's SQLite state read-only; all mutations go through the `agent-deck` CLI.
+- Nothing is purged or archived before its note is on disk. If `agent-deck-session-note` is missing, housekeeping says so in the log and carries on — that is the one case where a session can vanish uncaptured.
 - Archiving stops the tmux session but keeps everything; `agent-deck session unarchive <id>` restores it.
+- If ranking fails or returns nothing, every stale session is kept and flagged. Work is never archived on the strength of a broken scorer.
 - Wrap-ups cost a Claude turn each; `WRAP_LIMIT` bounds spend per run.
-- Dry-run any time: `WRAP_LIMIT=0 agent-deck-housekeeping`, then read `~/Library/Logs/agent-deck-housekeeping.log`.
+- Dry-run any time, without touching a session: `ARCHIVE_UNRANKED=0 WRAP_LIMIT=0 DEAD_DAYS=99999 agent-deck-housekeeping`, then read `~/Library/Logs/agent-deck-housekeeping.log`.
 
 ## Uninstall
 
 ```sh
 launchctl unload ~/Library/LaunchAgents/com.agent-deck-autopilot.housekeeping.plist
 rm ~/Library/LaunchAgents/com.agent-deck-autopilot.housekeeping.plist
-rm ~/.claude/hooks/agentdeck-auto-rename.sh ~/.local/bin/agent-deck-housekeeping
+rm ~/.claude/hooks/agentdeck-auto-rename.sh
+rm ~/.local/bin/agent-deck-{housekeeping,session-note,rank}
 ```
 
-and remove the hook entry from `~/.claude/settings.json`.
+and remove the hook entries from `~/.claude/settings.json`. Session notes under `~/.local/share/agent-deck-autopilot/` are left alone; delete them yourself once you are sure you want them gone.

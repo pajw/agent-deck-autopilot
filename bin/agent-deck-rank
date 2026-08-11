@@ -1,0 +1,227 @@
+#!/usr/bin/env python3
+"""Rank stale agent-deck sessions by whether they still matter.
+
+A weekly list of everything stale is an inventory, and an inventory that keeps
+growing gets skimmed. This scores each stale session against evidence outside
+the deck — is the ticket still open, is there unmerged work, did it stop
+mid-answer — so housekeeping can show the few that need a decision and retire
+the rest quietly.
+
+Reads candidate ids on stdin (one per line, may be short ids), or takes them as
+arguments. Prints TSV: score, id, title, reasons.
+
+Every probe is best-effort: a tool that is missing or fails scores zero rather
+than blocking the sweep.
+"""
+
+import os
+import re
+import subprocess
+import sqlite3
+import sys
+import time
+
+FRESH_DAYS, STALE_DAYS = 14, 30
+# agent-deck writes Go's zero time (-62135596800) for a timestamp it never set,
+# not 0. Taken literally that makes a session created this morning look two
+# millennia idle, so anything below this floor means "unset".
+EPOCH_FLOOR = 946684800  # 2000-01-01
+
+
+def conf():
+    path = os.path.expanduser("~/.config/agent-deck-autopilot.conf")
+    keys = ("AGENTDECK_TICKET_PREFIX", "TICKET_STATUS_CMD", "AGENTDECK_PROFILE",
+            "AGENTDECK_NOTES_DIR")
+    if not os.path.exists(path):
+        return dict.fromkeys(keys, "")
+    script = '. "$1"; ' + "; ".join(f'printf "%s\\n" "${k}"' for k in keys)
+    try:
+        out = subprocess.run(["sh", "-c", script, "sh", path],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return dict.fromkeys(keys, "")
+    got = dict(zip(keys, out.split("\n")))
+    return {k: (os.environ.get(k) or got.get(k) or "") for k in keys}
+
+
+CONF = conf()
+
+
+def run(args, cwd=None, timeout=20):
+    try:
+        p = subprocess.run(args, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout.strip()
+    except Exception:
+        return 1, ""
+
+
+def notes_dir():
+    d = CONF.get("AGENTDECK_NOTES_DIR") or "~/.local/share/agent-deck-autopilot/sessions"
+    return os.path.expanduser(d)
+
+
+def rows(prefixes):
+    profile = CONF.get("AGENTDECK_PROFILE") or "default"
+    db = os.path.expanduser(f"~/.agent-deck/profiles/{profile}/state.db")
+    where = " or ".join("id like ?" for _ in prefixes)
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        out = con.execute(
+            "select id,title,status,project_path,worktree_repo,worktree_branch,"
+            f"last_accessed,created_at from instances where {where}",
+            tuple(p + "%" for p in prefixes)).fetchall()
+        return [dict(r) for r in out]
+    except sqlite3.Error:
+        return []
+
+
+def ticket_of(title):
+    prefix = CONF.get("AGENTDECK_TICKET_PREFIX", "").strip()
+    pat = (rf"\b({re.escape(prefix)})-?(\d{{1,6}})\b" if prefix
+           else r"\b([A-Z][A-Z0-9]{1,9})-(\d{1,6})\b")
+    m = re.search(pat, title, re.I if prefix else 0)
+    return f"{m.group(1).upper()}-{m.group(2)}" if m else ""
+
+
+def ticket_open(key):
+    """Ask the configured command. No command configured means no opinion."""
+    cmd = CONF.get("TICKET_STATUS_CMD", "").strip()
+    if not cmd or not key:
+        return None
+    code, out = run(["sh", "-c", f'{cmd} "$1"', "sh", key], timeout=30)
+    if code != 0 or not out:
+        return None
+    low = out.lower()
+    # "ready to release" is shipped under continuous deployment: it is a status
+    # sweep, not work, so it must not pull a session up the ranking.
+    if re.search(r"\b(closed|done|released|resolved|cancelled|canceled)\b"
+                 r"|ready to release", low):
+        return False
+    if re.search(r"\bopen\b|in progress|in development|to do|backlog|review", low):
+        return True
+    return None
+
+
+def repo_of(row):
+    for path in (row.get("worktree_repo"), row.get("project_path")):
+        if path and os.path.isdir(path):
+            return path
+    return ""
+
+
+def branch_of(row, repo):
+    if row.get("worktree_branch"):
+        return row["worktree_branch"]
+    if repo:
+        _, out = run(["git", "-C", repo, "branch", "--show-current"], timeout=10)
+        return out
+    return ""
+
+
+def unmerged(repo, branch):
+    if not repo or not branch:
+        return 0
+    _, head = run(["git", "-C", repo, "symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+    base = head or "origin/HEAD"
+    for ref in (branch, f"origin/{branch}"):
+        code, out = run(["git", "-C", repo, "rev-list", "--count", f"{base}..{ref}"])
+        if code == 0 and out.isdigit():
+            return int(out)
+    return 0
+
+
+def open_pr(repo, branch):
+    if not repo or not branch or not run(["sh", "-c", "command -v gh"])[1]:
+        return ""
+    code, out = run(["gh", "pr", "list", "--head", branch, "--state", "open",
+                     "--json", "number", "--jq", ".[0].number"], cwd=repo, timeout=30)
+    return out if code == 0 and out.isdigit() else ""
+
+
+def note_says(instance_id, field):
+    path = os.path.join(notes_dir(), f"{instance_id}.md")
+    try:
+        with open(path) as fh:
+            if fh.readline().strip() != "---":
+                return ""
+            for line in fh:
+                if line.strip() == "---":
+                    break
+                k, _, v = line.partition(":")
+                if k.strip() == field:
+                    return v.strip()
+    except OSError:
+        pass
+    return ""
+
+
+def score(row):
+    points, why = 0, []
+    repo = repo_of(row)
+    branch = branch_of(row, repo)
+
+    key = ticket_of(row.get("title", ""))
+    state = ticket_open(key)
+    if state is True:
+        points += 4
+        why.append(f"{key} still open")
+    elif state is False:
+        why.append(f"{key} closed")
+
+    pr = open_pr(repo, branch)
+    if pr:
+        points += 3
+        why.append(f"PR #{pr} open")
+
+    ahead = unmerged(repo, branch)
+    if ahead:
+        points += 3
+        why.append(f"{ahead} commit{'s' if ahead > 1 else ''} unmerged on {branch}")
+
+    if note_says(row["id"], "ended_mid_turn") == "true":
+        points += 2
+        why.append("stopped mid-turn")
+    elif row.get("status") == "waiting":
+        points += 2
+        why.append("output never read")
+
+    if row.get("worktree_repo") and os.path.isdir(row["worktree_repo"]):
+        points += 1
+        why.append("worktree on disk")
+
+    # A session never opened since creation has no last_accessed; fall back to
+    # when it was made rather than treating it as infinitely stale.
+    stamps = [int(row.get(f) or 0) for f in ("last_accessed", "created_at")]
+    seen = next((s for s in stamps if s > EPOCH_FLOOR), 0)
+    if seen:
+        age = (time.time() - seen) / 86400
+        if age < FRESH_DAYS:
+            points += 2
+        elif age < STALE_DAYS:
+            points += 1
+        why.append(f"idle {int(age)}d")
+
+    return points, ", ".join(why)
+
+
+def main():
+    prefixes = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if not prefixes:
+        prefixes = [line.strip() for line in sys.stdin if line.strip()]
+    if not prefixes:
+        return 0
+    scored = []
+    for row in rows(prefixes):
+        try:
+            points, why = score(row)
+        except Exception as exc:
+            points, why = 0, f"scoring failed: {exc}"
+        scored.append((points, row["id"], row.get("title", ""), why))
+    for points, rid, title, why in sorted(scored, key=lambda s: -s[0]):
+        print(f"{points}\t{rid}\t{title}\t{why}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Keep a standing note for every agent-deck session, so a session that dies
+is still legible.
+
+The wrap-up path only fires on sessions that finish politely: a session whose
+tmux server goes away takes its context with it. This writes a short note to
+disk after every assistant turn, so the note is always current and death costs
+nothing.
+
+Modes:
+  (stdin JSON)              Claude Code Stop hook. Notes the current session.
+  --instance <id>           Rebuild one session's note from its transcript.
+  --all                     Rebuild every registered session's note.
+  --retire <id> --reason R  Stamp a note as retired (does not delete it).
+  --dir                     Print the notes directory and exit.
+
+Notes live in AGENTDECK_NOTES_DIR (default
+~/.local/share/agent-deck-autopilot/sessions), one markdown file per session,
+named <id>.md. They outlive the registry row on purpose: grep is the recovery
+path once a session is gone.
+"""
+
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+from collections import deque
+from datetime import datetime, timezone
+
+HEAD_BYTES = 256 * 1024
+TAIL_BYTES = 2 * 1024 * 1024
+BIG_FILE = 4 * 1024 * 1024
+TRAIL = 10
+EPOCH_FLOOR = 946684800  # 2000-01-01; anything below is an unset timestamp
+CLIP_FIRST = 500
+CLIP_LAST = 400
+CLIP_REPLY = 700
+CLIP_TRAIL = 110
+
+# Harness traffic arrives as user entries: system reminders, task notifications,
+# skill preambles, bash echoes. None of it was typed by a human, so none of it
+# belongs in the trail. Slash commands survive because tidy() unwraps them into
+# "/name args" before this runs; what is left starting with a lower-case tag is
+# always machine-generated.
+NOISE = re.compile(
+    r"^(<[a-z][a-z0-9-]*>|Base directory for this skill:|Caveat:|"
+    r"\[Request interrupted|API Error)"
+)
+
+
+def conf():
+    """Read the shell config the way a shell would, rather than guessing."""
+    path = os.path.expanduser("~/.config/agent-deck-autopilot.conf")
+    keys = ("AGENTDECK_NOTES_DIR", "AGENTDECK_PROFILE")
+    if not os.path.exists(path):
+        return {}
+    script = '. "$1"; ' + "; ".join(f'printf "%s\\n" "${k}"' for k in keys)
+    try:
+        out = subprocess.run(["sh", "-c", script, "sh", path],
+                             capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return {}
+    return dict(zip(keys, out.split("\n")))
+
+
+CONF = conf()
+
+
+def notes_dir():
+    d = os.environ.get("AGENTDECK_NOTES_DIR") or CONF.get("AGENTDECK_NOTES_DIR") or ""
+    d = d or "~/.local/share/agent-deck-autopilot/sessions"
+    return os.path.expanduser(d)
+
+
+def profile():
+    return (os.environ.get("AGENTDECK_PROFILE")
+            or CONF.get("AGENTDECK_PROFILE") or "default")
+
+
+def db_path():
+    return os.path.expanduser(f"~/.agent-deck/profiles/{profile()}/state.db")
+
+
+def rows(where="", args=()):
+    """Read the registry read-only. All mutation goes through the CLI."""
+    cols = ("id", "title", "group_path", "project_path", "status", "tmux_session",
+            "created_at", "last_accessed", "worktree_repo", "worktree_branch",
+            "archived_at")
+    try:
+        con = sqlite3.connect(f"file:{db_path()}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        sql = f"select {','.join(cols)} from instances {where}"
+        return [dict(r) for r in con.execute(sql, args).fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+def agent_deck():
+    return subprocess.run(
+        ["sh", "-c", "command -v agent-deck || echo /opt/homebrew/bin/agent-deck"],
+        capture_output=True, text=True).stdout.strip()
+
+
+def claude_session_id(instance_id):
+    """Find the Claude conversation behind a deck session.
+
+    The registry knows it, and knows it currently: a deck session can host
+    several conversations over its life and the .sid file only records the
+    last one a hook happened to see. Ask the CLI first, fall back to .sid.
+    """
+    try:
+        out = subprocess.run([agent_deck(), "session", "show", instance_id, "--json"],
+                             capture_output=True, text=True, timeout=15).stdout
+        uuid = json.loads(out or "{}").get("claude_session_id", "")
+        if uuid:
+            return uuid
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        pass
+
+    pat = os.path.expanduser(f"~/.agent-deck/hooks/{instance_id[:8]}-*.sid")
+    found = sorted(glob.glob(pat))
+    for path in reversed(found):
+        try:
+            with open(path) as fh:
+                uuid = fh.read().strip()
+            if uuid:
+                return uuid
+        except OSError:
+            continue
+    return ""
+
+
+def transcript_for(uuid):
+    if not uuid:
+        return ""
+    hits = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{uuid}.jsonl"))
+    return max(hits, key=os.path.getmtime) if hits else ""
+
+
+def transcript_head(path):
+    """First cwd and timestamp in a transcript, for matching one to a session."""
+    cwd = stamp = ""
+    try:
+        with open(path, "rb") as fh:
+            for _ in range(20):
+                raw = fh.readline()
+                if not raw:
+                    break
+                try:
+                    e = json.loads(raw)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                if isinstance(e, dict):
+                    cwd = cwd or e.get("cwd", "")
+                    stamp = stamp or e.get("timestamp", "")
+                    if cwd and stamp:
+                        break
+    except OSError:
+        pass
+    return cwd, stamp
+
+
+_INDEX = None
+
+
+def transcript_index():
+    """(cwd, start epoch, path) for every transcript on disk. Built once."""
+    global _INDEX
+    if _INDEX is None:
+        _INDEX = []
+        for path in glob.glob(os.path.expanduser("~/.claude/projects/*/*.jsonl")):
+            cwd, stamp = transcript_head(path)
+            if not cwd or not stamp:
+                continue
+            try:
+                start = datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
+            except ValueError:
+                continue
+            _INDEX.append((cwd, start, path))
+    return _INDEX
+
+
+def relink(row):
+    """Recover a transcript for a session whose .sid file was deleted.
+
+    Matches on project path and start time. Inferred, not authoritative, so
+    the note records how the link was made.
+    """
+    project = (row.get("project_path") or "").rstrip("/")
+    created, last = int(row.get("created_at") or 0), int(row.get("last_accessed") or 0)
+    if not project or not created:
+        return ""
+    lo, hi = created - 300, (last or created) + 86400
+    best = ()
+    for cwd, start, path in transcript_index():
+        if not (cwd == project or cwd.startswith(project + "/")):
+            continue
+        if lo <= start <= hi:
+            gap = abs(start - created)
+            if not best or gap < best[0]:
+                best = (gap, path)
+    return best[1] if best else ""
+
+
+def read_lines(path):
+    """Whole file when small; head and tail when not. Returns (lines, complete)."""
+    size = os.path.getsize(path)
+    with open(path, "rb") as fh:
+        if size <= BIG_FILE:
+            return fh.read().split(b"\n"), True
+        head = fh.read(HEAD_BYTES)
+        fh.seek(size - TAIL_BYTES)
+        tail = fh.read(TAIL_BYTES)
+    return head.split(b"\n")[:-1] + tail.split(b"\n")[1:], False
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        # A user entry carrying a tool_result is machine traffic, not a prompt.
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return ""
+        parts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+        return "\n".join(p for p in parts if p)
+    return ""
+
+
+SLASH = re.compile(r"<command-name>(.*?)</command-name>.*?"
+                   r"(?:<command-args>(.*?)</command-args>)?", re.S)
+
+
+def tidy(text):
+    """Render a slash-command expansion back as the command the user typed."""
+    m = SLASH.search(text)
+    if m:
+        return f"{m.group(1).strip()} {(m.group(2) or '').strip()}".strip()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def clip(text, n):
+    text = (text or "").strip()
+    return text if len(text) <= n else text[:n].rstrip() + "…"
+
+
+def scan(path):
+    """Pull the shape of a session out of its transcript.
+
+    Dedupes by promptId: a slash command expands into several user entries
+    sharing one id, and only the first is what the user actually sent.
+    """
+    out = {"first": "", "last_prompt": "", "last_reply": "", "turns": 0,
+           "trail": deque(maxlen=TRAIL), "complete": True, "mid_turn": False,
+           "started": "", "updated": ""}
+    try:
+        lines, out["complete"] = read_lines(path)
+    except OSError:
+        return out
+
+    seen = set()
+    last_kind = ""
+    for raw in lines:
+        if not raw.strip():
+            continue
+        try:
+            e = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if not isinstance(e, dict) or e.get("isSidechain"):
+            continue
+        kind, msg = e.get("type"), e.get("message")
+        if not isinstance(msg, dict):
+            continue
+        stamp = e.get("timestamp", "")
+        if stamp:
+            out["started"] = out["started"] or stamp
+            out["updated"] = stamp
+
+        if kind == "user":
+            pid = e.get("promptId") or e.get("uuid")
+            if pid in seen:
+                continue
+            body = tidy(text_of(msg.get("content")))
+            if not body or NOISE.match(body) or e.get("isMeta"):
+                continue
+            seen.add(pid)
+            out["turns"] += 1
+            out["first"] = out["first"] or body
+            out["last_prompt"] = body
+            out["trail"].append((stamp, body))
+            last_kind = "user"
+        elif kind == "assistant":
+            body = text_of(msg.get("content"))
+            if body.strip():
+                out["last_reply"] = body
+            last_kind = "assistant"
+
+    # The last thing in the file being a prompt means the reply never landed:
+    # the session was killed mid-answer, which is the state worth flagging.
+    out["mid_turn"] = last_kind == "user"
+    return out
+
+
+def iso(epoch):
+    # agent-deck writes Go's zero time (-62135596800) for timestamps it never
+    # set. Rendering that as a year-0001 date reads as data; blank reads as
+    # absent, which is what it is.
+    if not epoch or int(epoch) <= EPOCH_FLOOR:
+        return ""
+    try:
+        return datetime.fromtimestamp(int(epoch), timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    except (ValueError, OSError, OverflowError):
+        return ""
+
+
+def short(stamp):
+    try:
+        return datetime.fromisoformat(stamp.replace("Z", "+00:00")).strftime("%d %b %H:%M")
+    except (ValueError, AttributeError):
+        return "?"
+
+
+def branch_of(row):
+    if row.get("worktree_branch"):
+        return row["worktree_branch"]
+    cwd = row.get("project_path") or ""
+    if not os.path.isdir(cwd):
+        return ""
+    try:
+        return subprocess.run(["git", "-C", cwd, "branch", "--show-current"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return ""
+
+
+def note_path(instance_id):
+    return os.path.join(notes_dir(), f"{instance_id}.md")
+
+
+def existing_front(path, wanted=("retired", "retired_reason")):
+    """Preserve fields a rebuild cannot re-derive, such as a retirement stamp."""
+    keep = {}
+    try:
+        with open(path) as fh:
+            if fh.readline().strip() != "---":
+                return keep
+            for line in fh:
+                if line.strip() == "---":
+                    break
+                k, _, v = line.partition(":")
+                if k.strip() in wanted:
+                    keep[k.strip()] = v.strip()
+    except OSError:
+        return keep
+    return keep
+
+
+def newest_source(path, uuid, transcript):
+    """A deck session outlives any one conversation in it, and the .sid file
+    only ever names the latest one it saw. A backfill must not overwrite a
+    note built from a fresher transcript with a staler one.
+    """
+    prev = existing_front(path, ("transcript", "claude_session"))
+    old = prev.get("transcript", "")
+    if not old or not os.path.exists(old):
+        return uuid, transcript
+    if not transcript or not os.path.exists(transcript):
+        return prev.get("claude_session", uuid), old
+    if os.path.getmtime(old) > os.path.getmtime(transcript):
+        return prev.get("claude_session", uuid), old
+    return uuid, transcript
+
+
+def write_note(row, transcript="", uuid="", allow_relink=False):
+    given = bool(transcript)
+    uuid = uuid or claude_session_id(row["id"])
+    transcript = transcript or transcript_for(uuid)
+    if not given:
+        uuid, transcript = newest_source(note_path(row["id"]), uuid, transcript)
+    inferred = False
+    if not transcript and allow_relink:
+        transcript = relink(row)
+        inferred = bool(transcript)
+    data = scan(transcript) if transcript and os.path.exists(transcript) else scan("")
+
+    path = note_path(row["id"])
+    front = {
+        "instance": row["id"],
+        "title": row.get("title") or "(untitled)",
+        "group": row.get("group_path") or "",
+        "status": row.get("status") or "",
+        "project": row.get("project_path") or "",
+        "branch": branch_of(row),
+        "claude_session": uuid,
+        "transcript": transcript,
+        "created": iso(row.get("created_at")) or data["started"],
+        "last_active": iso(row.get("last_accessed")) or data["updated"],
+        "noted": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ"),
+        "turns": f"{data['turns']}{'' if data['complete'] else '+'}",
+        "ended_mid_turn": "true" if data["mid_turn"] else "false",
+    }
+    if inferred:
+        front["transcript_source"] = "matched by project and start time, not .sid"
+    front.update(existing_front(path))
+
+    body = [f"# {front['title']}", ""]
+    if front.get("retired"):
+        body += [f"> Retired {front['retired']}"
+                 f"{' — ' + front['retired_reason'] if front.get('retired_reason') else ''}."
+                 " Transcript and worktree are untouched.", ""]
+    if data["first"]:
+        body += ["## Opened with", "", f"> {clip(data['first'], CLIP_FIRST)}", ""]
+    if data["last_prompt"] and data["last_prompt"] != data["first"]:
+        body += ["## Last asked", "", f"> {clip(data['last_prompt'], CLIP_LAST)}", ""]
+    if data["last_reply"]:
+        body += ["## Last answered", "", clip(data["last_reply"], CLIP_REPLY), ""]
+    if data["mid_turn"]:
+        body += ["**Stopped mid-turn** — the last prompt never got an answer.", ""]
+    if len(data["trail"]) > 1:
+        body += ["## Prompt trail", ""]
+        body += [f"- `{short(s)}` {clip(t, CLIP_TRAIL)}" for s, t in data["trail"]]
+        body += [""]
+    if not transcript:
+        body += ["_No transcript found for this session; the .sid link is missing._", ""]
+
+    text = "---\n" + "".join(f"{k}: {v}\n" for k, v in front.items()) + "---\n\n"
+    text += "\n".join(body)
+
+    os.makedirs(notes_dir(), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+    return path
+
+
+def resolve(prefix):
+    match = rows("where id like ?", (prefix + "%",))
+    return match[0] if match else None
+
+
+def retire(prefix, reason):
+    row = resolve(prefix)
+    path = note_path(row["id"]) if row else ""
+    if row and not os.path.exists(path):
+        write_note(row)
+    if not path or not os.path.exists(path):
+        # Row already gone and no note: nothing left to stamp.
+        hits = glob.glob(os.path.join(notes_dir(), f"{prefix}*.md"))
+        if not hits:
+            return 1
+        path = hits[0]
+    with open(path) as fh:
+        text = fh.read()
+    stamp = (f"retired: {datetime.now(timezone.utc).strftime('%Y-%m-%d')}\n"
+             f"retired_reason: {reason}\n")
+    text = re.sub(r"^retired(_reason)?:.*\n", "", text, flags=re.M)
+    text = text.replace("---\n", "---\n" + stamp, 1)
+    with open(path, "w") as fh:
+        fh.write(text)
+    return 0
+
+
+def in_deck_session():
+    if not os.environ.get("TMUX"):
+        return False
+    try:
+        name = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return False
+    return name.startswith("agentdeck_")
+
+
+def from_hook():
+    if not in_deck_session():
+        return 0
+    try:
+        hook = json.loads(sys.stdin.read() or "{}")
+    except json.JSONDecodeError:
+        return 0
+    try:
+        cur = json.loads(subprocess.run([agent_deck(), "session", "current", "--json"],
+                                        capture_output=True, text=True,
+                                        timeout=15).stdout or "{}")
+    except (json.JSONDecodeError, OSError, subprocess.SubprocessError):
+        return 0
+    sid = cur.get("id")
+    if not sid:
+        return 0
+    row = resolve(sid) or {"id": sid, "title": cur.get("session", ""),
+                           "group_path": cur.get("group", ""),
+                           "project_path": hook.get("cwd", "")}
+    write_note(row, transcript=hook.get("transcript_path", ""),
+               uuid=hook.get("session_id", ""))
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if "--dir" in args:
+        print(notes_dir())
+        return 0
+    if "--retire" in args:
+        i = args.index("--retire")
+        reason = args[args.index("--reason") + 1] if "--reason" in args else "retired"
+        return retire(args[i + 1], reason)
+    wire = "--relink" in args
+    if "--all" in args:
+        for row in rows():
+            try:
+                write_note(row, allow_relink=wire)
+            except Exception as exc:  # one bad transcript must not stop the sweep
+                print(f"note failed for {row['id'][:8]}: {exc}", file=sys.stderr)
+        return 0
+    if "--instance" in args:
+        row = resolve(args[args.index("--instance") + 1])
+        if not row:
+            return 1
+        print(write_note(row, allow_relink=wire))
+        return 0
+    return from_hook()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -7,6 +7,8 @@ REPO="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$HOME/.claude/hooks" "$HOME/.local/bin" "$HOME/.config"
 ln -sf "$REPO/hooks/agentdeck-auto-rename.sh" "$HOME/.claude/hooks/agentdeck-auto-rename.sh"
 ln -sf "$REPO/bin/agent-deck-housekeeping" "$HOME/.local/bin/agent-deck-housekeeping"
+ln -sf "$REPO/bin/agent-deck-session-note" "$HOME/.local/bin/agent-deck-session-note"
+ln -sf "$REPO/bin/agent-deck-rank" "$HOME/.local/bin/agent-deck-rank"
 [ -f "$HOME/.config/agent-deck-autopilot.conf" ] || cp "$REPO/config.example.conf" "$HOME/.config/agent-deck-autopilot.conf"
 
 plist="$HOME/Library/LaunchAgents/com.agent-deck-autopilot.housekeeping.plist"
@@ -22,11 +24,24 @@ Done. Two manual steps remain:
 1. Edit ~/.config/agent-deck-autopilot.conf (ticket prefix, group rules,
    notifier).
 
-2. Register the hook in ~/.claude/settings.json under hooks.UserPromptSubmit:
+2. Register two hooks in ~/.claude/settings.json.
+
+   hooks.UserPromptSubmit — names and groups the session:
 
    { "type": "command",
      "command": "~/.claude/hooks/agentdeck-auto-rename.sh",
      "async": true, "timeout": 20 }
 
-Dry-run the housekeeping any time:  WRAP_LIMIT=0 agent-deck-housekeeping
+   hooks.Stop — keeps its standing note current, so a session that dies
+   without a wrap-up still leaves a readable record:
+
+   { "type": "command",
+     "command": "~/.local/bin/agent-deck-session-note",
+     "async": true, "timeout": 20 }
+
+Dry-run the housekeeping any time, without touching a session:
+
+   ARCHIVE_UNRANKED=0 WRAP_LIMIT=0 DEAD_DAYS=99999 agent-deck-housekeeping
+
+then read ~/Library/Logs/agent-deck-housekeeping.log.
 MSG

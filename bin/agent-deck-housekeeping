@@ -1,28 +1,47 @@
 #!/usr/bin/env bash
 # agent-deck-housekeeping: scheduled deck hygiene.
 #
-#   1. Purge dead sessions (no tmux pane, idle DEAD_DAYS+) from the registry.
-#   2. Remove orphaned per-session state files in ~/.agent-deck/hooks.
-#   3. Send WRAP_COMMAND into live Claude sessions idle IDLE_DAYS+ (max
-#      WRAP_LIMIT per run, 'idle' status only; sessions sitting on a prompt
-#      or question are flagged, never typed into), then archive the ones
-#      that finish cleanly.
-#   4. Report the sweep via NOTIFY_CMD, or the log when none is configured.
+#   0. Refresh the standing note for every session, so nothing is ever retired
+#      without a readable record of what it was and where it got to.
+#   1. Stamp, then purge, dead sessions (no tmux pane, idle DEAD_DAYS+).
+#   2. Archive orphaned per-session state files instead of deleting them: the
+#      .sid file is the only link from a session to its Claude transcript.
+#   3. Rank stale live sessions against evidence outside the deck. Keep the top
+#      RANK_KEEP for you to decide on; wrap up and archive the rest.
+#   4. Report the few that need a decision, and a count of what was retired.
 #
 # Configuration (optional): ~/.config/agent-deck-autopilot.conf, shell syntax.
 #   IDLE_DAYS (7)  DEAD_DAYS (14)  WRAP_LIMIT (3)  WRAP_TIMEOUT_MIN (25)
+#   RANK_KEEP (3)          how many stale sessions survive a sweep for you
+#   ARCHIVE_UNRANKED (1)   archive the rest; 0 flags them instead
+#   STATE_ARCHIVE_DAYS (180)  how long retired .sid files are kept
 #   WRAP_COMMAND (/wrap-up)   AGENTDECK_PROFILE (default)
-#   NOTIFY_CMD    command accepting --title/--text/--subtle, e.g. a webhook
-#                 poster. Unset: summary goes to the log only.
+#   TICKET_STATUS_CMD      command taking a ticket key, printing its status
+#   NOTIFY_CMD             command accepting --title/--text/--subtle
 # Env overrides for testing: TEST_WRAP_ID (force one session through the
 # wrap path), DRY_RUN (passed through to NOTIFY_CMD).
 set -uo pipefail
 
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
 export AGENTDECK_SUPPRESS_TMUX_WARNING=1
+
+# The config file supplies defaults; anything already in the environment wins.
+# Without this the file silently overrides the documented test overrides, and
+# a run meant to be quiet still notifies.
+KNOBS="IDLE_DAYS DEAD_DAYS WRAP_LIMIT WRAP_TIMEOUT_MIN WRAP_COMMAND RANK_KEEP
+       ARCHIVE_UNRANKED STATE_ARCHIVE_DAYS NOTIFY_CMD TICKET_STATUS_CMD
+       AGENTDECK_PROFILE AGENTDECK_NOTES_DIR"
+_preset=""
+for _k in $KNOBS; do
+  [ -n "${!_k+set}" ] && _preset+="$_k=$(printf '%q' "${!_k}"); "
+done
 [ -f "$HOME/.config/agent-deck-autopilot.conf" ] && . "$HOME/.config/agent-deck-autopilot.conf"
+[ -n "$_preset" ] && eval "$_preset"
+export TICKET_STATUS_CMD="${TICKET_STATUS_CMD:-}"
 
 AD=$(command -v agent-deck || echo /opt/homebrew/bin/agent-deck)
+NOTE=$(command -v agent-deck-session-note || echo "$HOME/.local/bin/agent-deck-session-note")
+RANK=$(command -v agent-deck-rank || echo "$HOME/.local/bin/agent-deck-rank")
 PROFILE=${AGENTDECK_PROFILE:-default}
 DB="$HOME/.agent-deck/profiles/$PROFILE/state.db"
 LOG="$HOME/Library/Logs/agent-deck-housekeeping.log"
@@ -31,89 +50,148 @@ DEAD_DAYS=${DEAD_DAYS:-14}
 WRAP_LIMIT=${WRAP_LIMIT:-3}
 WRAP_TIMEOUT_MIN=${WRAP_TIMEOUT_MIN:-25}
 WRAP_COMMAND=${WRAP_COMMAND:-/wrap-up}
+RANK_KEEP=${RANK_KEEP:-3}
+ARCHIVE_UNRANKED=${ARCHIVE_UNRANKED:-1}
+STATE_ARCHIVE_DAYS=${STATE_ARCHIVE_DAYS:-180}
 NOTIFY_CMD=${NOTIFY_CMD:-}
 
 log() { echo "[$(date '+%F %T')] $*" >> "$LOG"; }
 db()  { sqlite3 -separator '|' "file:$DB?mode=ro" "$1" 2>/dev/null; }
+alive() { [ -n "$1" ] && tmux has-session -t "$1" 2>/dev/null; }
 
 [ -x "$AD" ] || { log "agent-deck binary missing, aborting"; exit 0; }
 [ -f "$DB" ] || { log "state db missing at $DB, aborting"; exit 0; }
-summary=""
+summary="" decisions="" retired_count=0
 
-# --- 1. purge dead sessions ---------------------------------------------------
-dead=$("$AD" session cleanup --days "$DEAD_DAYS" --yes 2>&1 | tail -3 | tr '\n' ' ')
-log "cleanup(--days $DEAD_DAYS): $dead"
-summary+="Dead-session purge: ${dead:-nothing}\n"
+NOTES_DIR=$("$NOTE" --dir 2>/dev/null || echo "$HOME/.local/share/agent-deck-autopilot/sessions")
+STATE_ARCHIVE="$(dirname "$NOTES_DIR")/retired-state"
 
-# --- 2. orphaned state files ----------------------------------------------------
+# --- 0. standing notes ---------------------------------------------------------
+# Everything below this line can destroy a registry row. Nothing may do so
+# before the session has a note on disk.
+if [ -x "$NOTE" ]; then
+  "$NOTE" --all --relink >/dev/null 2>&1
+  log "notes refreshed: $(ls "$NOTES_DIR" 2>/dev/null | wc -l | tr -d ' ') on disk"
+else
+  log "WARNING: agent-deck-session-note not found; purging without capture"
+fi
+
+# --- 1. purge dead sessions ----------------------------------------------------
+# Stamp what actually went, rather than predicting cleanup's choice: take the
+# id list before and after and mark the difference. The notes written in step 0
+# survive the row, so retire() still finds them.
+before=$(db "select id || '|' || title from instances;")
+purged=$("$AD" session cleanup --days "$DEAD_DAYS" --yes 2>&1 | tail -3 | tr '\n' ' ')
+log "cleanup(--days $DEAD_DAYS): $purged"
+after=$(db "select id from instances;")
+while IFS='|' read -r id title; do
+  [ -n "$id" ] || continue
+  echo "$after" | grep -qx "$id" && continue
+  [ -x "$NOTE" ] && "$NOTE" --retire "$id" \
+    --reason "purged: no tmux pane, idle ${DEAD_DAYS}d+" >/dev/null 2>&1
+  log "purged and stamped: $id ($title)"
+done <<< "$before"
+
+# --- 2. retire orphaned state files -------------------------------------------
+# These used to be deleted. The .sid inside is the only pointer from a deck
+# session to its transcript, so losing it makes the transcript unfindable.
+mkdir -p "$STATE_ARCHIVE"
 live_ids=$(db "select substr(id,1,8) from instances;")
-removed=0
+moved=0
 for f in "$HOME"/.agent-deck/hooks/*.json "$HOME"/.agent-deck/hooks/*.sid; do
   [ -e "$f" ] || continue
   prefix=$(basename "$f"); prefix=${prefix%%-*}
-  echo "$live_ids" | grep -q "^$prefix$" || { rm -f "$f"; removed=$((removed+1)); }
+  echo "$live_ids" | grep -q "^$prefix$" && continue
+  mv -f "$f" "$STATE_ARCHIVE/" 2>/dev/null && moved=$((moved+1))
 done
+find "$STATE_ARCHIVE" -type f -mtime "+$STATE_ARCHIVE_DAYS" -delete 2>/dev/null
 find "$HOME/.agent-deck" -maxdepth 1 -name 'debug-*.log.gz' -mtime +30 -delete 2>/dev/null
-log "orphan files removed: $removed"
-summary+="Orphaned state files removed: $removed\n"
+log "orphaned state files retired to $STATE_ARCHIVE: $moved"
 
-# --- 3. wrap-up sweep ------------------------------------------------------------
+# --- 3. rank the stale, retire the rest ---------------------------------------
 cutoff=$(( $(date +%s) - IDLE_DAYS * 86400 ))
 if [ -n "${TEST_WRAP_ID:-}" ]; then
-  candidates=$(db "select substr(id,1,8), title, status, tmux_session from instances
+  candidates=$(db "select id, title, status, tmux_session from instances
                    where id like '${TEST_WRAP_ID}%';")
 else
-  candidates=$(db "select substr(id,1,8), title, status, tmux_session from instances
+  candidates=$(db "select id, title, status, tmux_session from instances
                    where archived_at = 0 and is_conductor = 0 and pin = ''
-                     and tool = 'claude'
-                     and status in ('idle','waiting')
-                     and last_accessed > 0 and last_accessed < $cutoff;")
+                     and tool = 'claude' and status in ('idle','waiting')
+                     and (case when last_accessed > 946684800 then last_accessed else created_at end) < $cutoff;")
 fi
 
-wrapped="" flagged="" wrap_count=0
-while IFS='|' read -r id title status tmux; do
+live_stale=""
+while IFS='|' read -r id title status tmux_name; do
   [ -n "$id" ] || continue
-  tmux has-session -t "$tmux" 2>/dev/null || continue   # dead: cleanup's job
-  [ -n "${TEST_WRAP_ID:-}" ] && status=idle             # test override: force the wrap path
-  if [ "$status" = "waiting" ]; then
-    flagged+="• $title (waiting on input, idle ${IDLE_DAYS}d+)\n"
-    continue
-  fi
-  [ "$wrap_count" -lt "$WRAP_LIMIT" ] || { flagged+="• $title (idle, over wrap limit this run)\n"; continue; }
-  wrap_count=$((wrap_count+1))
-  log "sending $WRAP_COMMAND to $id ($title)"
-  msg="$WRAP_COMMAND automated stale-session sweep: this session has been idle ${IDLE_DAYS}+ days and will be archived after wrap-up. Proceed without asking questions; skip anything that needs my input and list it in the report instead."
-  if ! "$AD" session send "$id" "$msg" --defer-if-busy >/dev/null 2>&1; then
-    log "send failed for $id"; flagged+="• $title (wrap-up send failed)\n"; continue
-  fi
-  # 'waiting' = turn finished with unread output, so it only counts as done
-  # once we've seen the wrap-up actually running; 'idle' always counts.
-  end=$(( $(date +%s) + WRAP_TIMEOUT_MIN * 60 )); final="" seen_running=0
-  sleep 20
-  while [ "$(date +%s)" -lt "$end" ]; do
-    final=$(db "select status from instances where id like '${id}%';")
-    case "$final" in
-      running|starting) seen_running=1 ;;
-      idle|error) break ;;
-      waiting) [ "$seen_running" = 1 ] && break ;;
-    esac
-    sleep 30
-  done
-  if { [ "$final" = "idle" ] || [ "$final" = "waiting" ]; } && [ "$seen_running" = 1 ]; then
-    "$AD" session archive "$id" >/dev/null 2>&1
-    log "wrapped + archived $id ($title)"
-    wrapped+="• $title (report in transcript; unarchive to revisit)\n"
-  else
-    log "wrap-up did not settle for $id (status: ${final:-timeout}, seen_running=$seen_running)"
-    flagged+="• $title (wrap-up ended '${final:-timeout}', left un-archived)\n"
-  fi
+  alive "$tmux_name" || continue          # dead ones are step 1's business
+  live_stale+="$id|$title|$status"$'\n'
 done <<< "$candidates"
+live_stale=$(printf '%s' "$live_stale" | sed '/^$/d')
 
-[ -n "$wrapped" ] && summary+="Wrapped up + archived:\n$wrapped"
-[ -n "$flagged" ] && summary+="Needs your attention:\n$flagged"
-[ -z "$wrapped$flagged" ] && summary+="No stale sessions to wrap.\n"
+if [ -z "$live_stale" ]; then
+  summary+="No stale sessions this week.\n"
+else
+  ranked=$(printf '%s\n' "$live_stale" | cut -d'|' -f1 | "$RANK" 2>/dev/null)
+  # Ranking is advisory. If it fails, keep everything and decide by hand
+  # rather than archiving work on the strength of a broken scorer.
+  if [ -z "$ranked" ]; then
+    log "ranking produced nothing; leaving all stale sessions alone"
+    while IFS='|' read -r id title status; do
+      decisions+="• $title (idle ${IDLE_DAYS}d+, ranking unavailable)\n"
+    done <<< "$live_stale"
+  else
+    keep=$(printf '%s\n' "$ranked" | head -n "$RANK_KEEP")
+    drop=$(printf '%s\n' "$ranked" | tail -n "+$((RANK_KEEP+1))")
 
-# --- 4. notify --------------------------------------------------------------------
+    while IFS=$'\t' read -r score id title why; do
+      [ -n "$id" ] || continue
+      decisions+="• $title — $why\n"
+    done <<< "$keep"
+
+    wrap_count=0
+    while IFS=$'\t' read -r score id title why; do
+      [ -n "$id" ] || continue
+      if [ "$ARCHIVE_UNRANKED" != "1" ]; then
+        decisions+="• $title — $why (not archived: ARCHIVE_UNRANKED=0)\n"
+        continue
+      fi
+      status=$(db "select status from instances where id = '$id';")
+      # Only 'idle' is ever typed into: a 'waiting' session may be sitting on
+      # a permission prompt, and sending keys to one is how accidents happen.
+      if [ "$status" = "idle" ] && [ "$wrap_count" -lt "$WRAP_LIMIT" ]; then
+        wrap_count=$((wrap_count+1))
+        log "sending $WRAP_COMMAND to $id ($title)"
+        msg="$WRAP_COMMAND automated stale-session sweep: this session has been idle ${IDLE_DAYS}+ days and will be archived after wrap-up. Proceed without asking questions; skip anything that needs my input and list it in the report instead."
+        if "$AD" session send "$id" "$msg" --defer-if-busy >/dev/null 2>&1; then
+          end=$(( $(date +%s) + WRAP_TIMEOUT_MIN * 60 )); final="" seen_running=0
+          sleep 20
+          while [ "$(date +%s)" -lt "$end" ]; do
+            final=$(db "select status from instances where id = '$id';")
+            case "$final" in
+              running|starting) seen_running=1 ;;
+              idle|error) break ;;
+              waiting) [ "$seen_running" = 1 ] && break ;;
+            esac
+            sleep 30
+          done
+          [ "$seen_running" = 1 ] && log "wrapped $id ($title)" \
+            || log "wrap-up never started for $id (status ${final:-timeout})"
+        else
+          log "send failed for $id"
+        fi
+      fi
+      [ -x "$NOTE" ] && "$NOTE" --retire "$id" --reason "archived by weekly sweep: $why" >/dev/null 2>&1
+      "$AD" session archive "$id" >/dev/null 2>&1 && retired_count=$((retired_count+1))
+      log "archived $id ($title)"
+    done <<< "$drop"
+  fi
+fi
+
+# --- 4. report ------------------------------------------------------------------
+[ -n "$decisions" ] && summary+="Still live, your call:\n$decisions"
+[ "$retired_count" -gt 0 ] && summary+="Retired $retired_count session(s); notes in $NOTES_DIR\n"
+case "$purged" in *"No dead sessions"*) ;; *) summary+="$purged\n" ;; esac
+
 total=$(db "select count(*) from instances where archived_at = 0;")
 body=$(printf "%b" "$summary")
 if [ -n "$NOTIFY_CMD" ] && command -v "$NOTIFY_CMD" >/dev/null 2>&1; then

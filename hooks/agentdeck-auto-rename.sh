@@ -98,7 +98,7 @@ def describe(ticket):
     """What the ticket is about, in the words of whoever wrote it.
 
     A key alone says which work item a session belongs to and nothing about
-    what it is doing, which is the whole problem with "LA-39776" as a title.
+    what it is doing, which is the whole problem with "KEY-123" as a title.
     """
     cmd = (os.environ.get("AGENTDECK_TICKET_TITLE_CMD") or "").strip()
     if not cmd:
@@ -132,7 +132,7 @@ if ticket:
     if slug in ("trunk", "main", "master", "develop"):
         slug = ""
     # Only ever overwrite a title this hook would have written itself. Anything
-    # else in the title is Paul's wording and outranks the ticket summary.
+    # else in the title is your wording, and outranks the ticket summary.
     ours = {ticket, f"{ticket} {slug}".strip()}
     if ticket_in_title and title not in ours:
         sys.exit(0)

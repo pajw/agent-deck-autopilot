@@ -2,13 +2,13 @@
 
 Keeps an [Agent Deck](https://github.com/asheshgoplani/agent-deck) tidy when it becomes your main funnel into Claude Code: sessions name themselves, sort themselves into groups, and stale ones get wrapped up and archived on a schedule.
 
-Born of a deck with 35 sessions all called `learnamp-xx` in one group. Never again.
+Born of a deck with 35 sessions all called `myrepo-xx` in one group. Never again.
 
 ## What it does
 
 **Auto-naming and auto-grouping** (`hooks/agentdeck-auto-rename.sh`): a Claude Code `UserPromptSubmit` hook. On each prompt inside an agent-deck session it:
 
-- renames the session to `KEY-123 <what the ticket is about>` when the prompt or git branch mentions a ticket, then locks the title so agent-deck's name sync can't overwrite it (upstream issue #697). The description comes from `AGENTDECK_TICKET_TITLE_CMD`, a command of yours that turns a ticket key into its summary; without one it falls back to the branch slug. A key on its own tells you which work item a session belongs to and nothing about what it is doing, which is the entire problem with a deck full of `LA-39776`;
+- renames the session to `KEY-123 <what the ticket is about>` when the prompt or git branch mentions a ticket, then locks the title so agent-deck's name sync can't overwrite it (upstream issue #697). The description comes from `AGENTDECK_TICKET_TITLE_CMD`, a command of yours that turns a ticket key into its summary; without one it falls back to the branch slug. A key on its own tells you which work item a session belongs to and nothing about what it is doing, which is the entire problem with a deck full of `KEY-123`;
 - never overwrites a title you wrote yourself — only ones it wrote itself;
 - otherwise replaces path-derived titles (`myrepo-3f`) with the first words of the prompt;
 - classifies sessions still sitting in a default group using your configured keyword rules (first match wins), with an optional fallback group for ticketed work. Sessions you've grouped by hand are never moved.
@@ -19,7 +19,7 @@ This exists because wrap-up only fires on sessions that finish politely. A sessi
 
 It also runs standalone — `--all` to rebuild every note, `--relink` to recover a transcript whose `.sid` pointer was lost by matching project path and start time.
 
-**Naming the unticketed** (`bin/agent-deck-name-session`): a `Stop` hook that titles the sessions no ticket key can describe — spikes, investigations, one-offs — by asking a cheap model to read the standing note and name the work in a few words. `thingy` becomes `conversational jd-writer interface`.
+**Naming the unticketed** (`bin/agent-deck-name-session`): a `Stop` hook that titles the sessions no ticket key can describe — spikes, investigations, one-offs — by asking a cheap model to read the standing note and name the work in a few words. `thingy` becomes `jd writer live chat`.
 
 It runs once per session, after a few turns, and locks the result. A title that keeps changing is worse than a bad one, because you stop being able to find anything. `--dry-run` shows what it would do; `AGENTDECK_AUTONAME=0` turns it off.
 
@@ -63,7 +63,7 @@ Requires agent-deck v1.10+ (for `session set-title-lock` and `session cleanup`),
 launchctl unload ~/Library/LaunchAgents/com.agent-deck-autopilot.housekeeping.plist
 rm ~/Library/LaunchAgents/com.agent-deck-autopilot.housekeeping.plist
 rm ~/.claude/hooks/agentdeck-auto-rename.sh
-rm ~/.local/bin/agent-deck-{housekeeping,session-note,rank}
+rm ~/.local/bin/agent-deck-{housekeeping,session-note,rank,name-session}
 ```
 
 and remove the hook entries from `~/.claude/settings.json`. Session notes under `~/.local/share/agent-deck-autopilot/` are left alone; delete them yourself once you are sure you want them gone.

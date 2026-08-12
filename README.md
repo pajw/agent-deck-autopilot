@@ -18,7 +18,7 @@ This exists because wrap-up only fires on sessions that finish politely. A sessi
 
 It also runs standalone — `--all` to rebuild every note, `--relink` to recover a transcript whose `.sid` pointer was lost by matching project path and start time.
 
-**Naming the unticketed** (`bin/agent-deck-name-session`): a `Stop` hook that titles the sessions no ticket key can describe — spikes, investigations, one-offs — by asking a cheap model to read the standing note and name the work in a few words. `thingy` becomes `jd writer live chat`.
+**Naming the unticketed** (`bin/agent-deck-name-session`): a `Stop` hook that titles the sessions no ticket key can describe — spikes, investigations, one-offs — by asking a cheap model to read the standing note and name the work in a few words. `thingy` becomes `voice agent prototype`.
 
 It runs once per session, after a few turns, and locks the result. A title that keeps changing is worse than a bad one, because you stop being able to find anything. `--dry-run` shows what it would do; `AGENTDECK_AUTONAME=0` turns it off.
 

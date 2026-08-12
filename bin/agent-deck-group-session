@@ -164,10 +164,10 @@ def opening(note):
 
     Keyword rules read this and nothing else from the note. A session is
     about what you started it for; everything after that wanders, and a reply
-    that happens to mention Rollbar is not a session about Rollbar. Matching
-    the whole trail files a delivery session under "people" because someone's
-    name came up in passing. The model fallback gets the full note instead —
-    it can tell a mention from a subject.
+    that happens to mention an outage is not a session about an outage.
+    Matching the whole trail files a delivery session under "people" because
+    someone's name came up in passing. The model fallback gets the full note
+    instead — it can tell a mention from a subject.
     """
     body = note.split("\n---", 1)[-1]
     m = re.search(r"^## Opened with\s*\n\s*\n> (.*)$", body, re.M)

@@ -18,7 +18,7 @@
 # exists and one component owns placement.
 #
 # Configuration (optional): ~/.config/agent-deck-autopilot.conf, shell syntax.
-#   AGENTDECK_TICKET_PREFIX  Jira project key, e.g. "LA". Unset: any KEY-123.
+#   AGENTDECK_TICKET_PREFIX  Tracker project key, e.g. "PROJ". Unset: any KEY-123.
 #   AGENTDECK_TICKET_TITLE_CMD  Command taking a ticket key and printing its
 #                            summary, used to title the session with what the
 #                            work is rather than just its key.

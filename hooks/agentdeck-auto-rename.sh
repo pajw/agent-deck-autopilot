@@ -1,6 +1,6 @@
 #!/bin/bash
-# Auto-name and auto-group agent-deck sessions so the deck never fills with
-# path-derived names like "myrepo-3f" in the default group.
+# Auto-name agent-deck sessions so the deck never fills with path-derived
+# names like "myrepo-3f".
 #
 # Claude Code UserPromptSubmit hook. Naming rules:
 #   1. Not inside an agent-deck tmux session: no-op.
@@ -10,15 +10,15 @@
 #      (upstream issue #697).
 #   4. No ticket but the title is still path-derived (e.g. "myrepo-3f"): rename
 #      to the first words of the prompt, unlocked so a later ticket wins.
-# Grouping rules (only while the session sits in a default group):
-#   first matching AGENTDECK_GROUP_RULES entry wins; otherwise a ticketed
-#   session goes to AGENTDECK_TICKET_GROUP if set. Sessions you have already
-#   moved to a group by hand are never touched.
+#
+# Grouping used to live here, gated on the session sitting in a default group.
+# Agent Deck creates a session in whichever group the cursor is on, so that
+# gate was almost never open and almost nothing was ever filed. It is now
+# agent-deck-group-session's job, on the Stop hook, where the standing note
+# exists and one component owns placement.
 #
 # Configuration (optional): ~/.config/agent-deck-autopilot.conf, shell syntax.
 #   AGENTDECK_TICKET_PREFIX  Jira project key, e.g. "LA". Unset: any KEY-123.
-#   AGENTDECK_GROUP_RULES    "group=regex;group=regex" (ordered, first wins).
-#   AGENTDECK_TICKET_GROUP   Group for ticketed sessions with no rule match.
 #   AGENTDECK_TICKET_TITLE_CMD  Command taking a ticket key and printing its
 #                            summary, used to title the session with what the
 #                            work is rather than just its key.
@@ -31,8 +31,7 @@ sess=$(tmux display-message -p '#S' 2>/dev/null)
 case "$sess" in agentdeck_*) ;; *) exit 0 ;; esac
 export AGENTDECK_SUPPRESS_TMUX_WARNING=1
 [ -f "$HOME/.config/agent-deck-autopilot.conf" ] && . "$HOME/.config/agent-deck-autopilot.conf"
-export AGENTDECK_TICKET_PREFIX AGENTDECK_GROUP_RULES AGENTDECK_TICKET_GROUP 2>/dev/null
-export AGENTDECK_TICKET_TITLE_CMD AGENTDECK_TITLE_MAX 2>/dev/null
+export AGENTDECK_TICKET_PREFIX AGENTDECK_TICKET_TITLE_CMD AGENTDECK_TITLE_MAX 2>/dev/null
 
 INPUT=$(cat) CUR=$("$AD" session current --json 2>/dev/null) /usr/bin/python3 - "$AD" << 'PY'
 import json, os, re, subprocess, sys
@@ -44,7 +43,7 @@ try:
 except json.JSONDecodeError:
     sys.exit(0)
 
-sid, title, group = cur.get("id"), cur.get("session", ""), cur.get("group", "")
+sid, title = cur.get("id"), cur.get("session", "")
 if not sid:
     sys.exit(0)
 
@@ -73,25 +72,6 @@ def find_ticket(text, flags):
 
 def run(*args):
     subprocess.run([ad, *args], capture_output=True, timeout=10)
-
-# --- grouping: only lift sessions out of the default buckets -----------------
-if group in ("", "my-sessions", "others"):
-    text = f"{title} {prompt} {branch}".lower()
-    target = None
-    for rule in (os.environ.get("AGENTDECK_GROUP_RULES") or "").split(";"):
-        if "=" not in rule:
-            continue
-        g, rx = rule.split("=", 1)
-        try:
-            if re.search(rx, text):
-                target = g.strip()
-                break
-        except re.error:
-            continue
-    if not target and (find_ticket(text, re.I) or "/deliver" in text):
-        target = (os.environ.get("AGENTDECK_TICKET_GROUP") or "").strip() or None
-    if target:
-        run("group", "move", sid, target)
 
 # --- naming -------------------------------------------------------------------
 def describe(ticket):

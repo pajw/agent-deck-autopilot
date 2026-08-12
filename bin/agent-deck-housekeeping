@@ -76,6 +76,14 @@ else
   log "WARNING: agent-deck-session-note not found; purging without capture"
 fi
 
+# Re-file anything that drifted, now that the notes say what each session is.
+# Sessions you moved by hand carry a stamp that says so and are left alone.
+GROUPER=$(command -v agent-deck-group-session || echo "$HOME/.local/bin/agent-deck-group-session")
+if [ -x "$GROUPER" ]; then
+  moves=$("$GROUPER" --all 2>/dev/null | grep -c '^moved ')
+  log "regrouped: $moves session(s) moved"
+fi
+
 # --- 1. purge dead sessions ----------------------------------------------------
 # Stamp what actually went, rather than predicting cleanup's choice: take the
 # id list before and after and mark the difference. The notes written in step 0

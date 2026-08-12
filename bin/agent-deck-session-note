@@ -346,8 +346,13 @@ def note_path(instance_id):
     return os.path.join(notes_dir(), f"{instance_id}.md")
 
 
-def existing_front(path, wanted=("retired", "retired_reason")):
-    """Preserve fields a rebuild cannot re-derive, such as a retirement stamp."""
+def existing_front(path, wanted=("retired", "retired_reason", "auto_named", "auto_group")):
+    """Preserve fields a rebuild cannot re-derive, such as a retirement stamp.
+
+    The auto_* stamps matter as much as the retirement one: they are how the
+    naming and grouping passes know they have already had their say. Dropping
+    them on rebuild silently turns "once per session" into "every turn".
+    """
     keep = {}
     try:
         with open(path) as fh:

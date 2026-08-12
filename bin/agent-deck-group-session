@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+"""File agent-deck sessions into groups by what the work is about.
+
+Agent Deck creates a session in whichever group the cursor happens to be
+parked on. That is a position, not a decision, so a deck fills up with
+unrelated sessions in whichever group you last looked at. The old grouping
+pass (in the rename hook) only ever touched sessions sitting in a default
+bucket, which meant it never ran on any of them.
+
+This owns group placement instead:
+
+  * A session with no autopilot stamp is fair game wherever it was born.
+  * A session where the stamp still matches its group is one this tool put
+    there, so it may be re-filed as the evidence gets better.
+  * A session whose group differs from the stamp was moved by you. It is
+    never touched again.
+  * A session in a group this tool does not manage is left alone.
+
+Classification is cheap first: ordered keyword rules over the title, branch
+and prompts, then the ticket fallback. Only when those say nothing does it
+ask a small model to read the standing note, which is what catches the
+sessions called "sweep" or "dependabot" that no regex will ever place.
+
+Modes:
+  (stdin JSON)      Claude Code Stop hook. Files the current session.
+  --instance <id>   File one session.
+  --all             File every eligible session (the on-demand resort).
+  --force           Ignore the stamp; re-file even sessions you moved.
+  --no-llm          Rules and ticket fallback only.
+  --dry-run         Print what it would do; change nothing.
+
+Configuration (optional): ~/.config/agent-deck-autopilot.conf
+  AGENTDECK_AUTOGROUP     0 disables entirely (default 1).
+  AGENTDECK_GROUP_RULES   "group=regex;group=regex", ordered, first wins.
+  AGENTDECK_TICKET_GROUP  Group for ticketed sessions matching no rule.
+  AGENTDECK_GROUP_DESCRIPTIONS  "group=what belongs here;group=..." — the
+                          taxonomy shown to the model. Groups named here are
+                          managed even if no keyword rule mentions them.
+  AGENTDECK_GROUP_MODEL / AGENTDECK_GROUP_MIN_TURNS  the model fallback.
+"""
+
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+DEFAULT_MODEL = "claude-haiku-4-5-20251001"
+DEFAULT_GROUPS = ("", "my-sessions", "others")
+CONF_KEYS = ("AGENTDECK_AUTOGROUP", "AGENTDECK_GROUP_RULES", "AGENTDECK_TICKET_GROUP",
+             "AGENTDECK_GROUP_DESCRIPTIONS", "AGENTDECK_GROUP_MODEL",
+             "AGENTDECK_GROUP_MIN_TURNS", "AGENTDECK_NOTES_DIR", "AGENTDECK_PROFILE",
+             "AGENTDECK_TICKET_PREFIX")
+
+# Asking the model to classify launches a Claude process, which fires this
+# hook again. Without a guard that recurses until something gives way.
+if os.environ.get("AGENTDECK_AUTOPILOT_CHILD"):
+    sys.exit(0)
+
+
+def conf():
+    path = os.path.expanduser("~/.config/agent-deck-autopilot.conf")
+    got = dict.fromkeys(CONF_KEYS, "")
+    if os.path.exists(path):
+        script = '. "$1"; ' + "; ".join(f'printf "%s\\n" "${k}"' for k in CONF_KEYS)
+        try:
+            out = subprocess.run(["sh", "-c", script, "sh", path],
+                                 capture_output=True, text=True, timeout=10).stdout
+            got = dict(zip(CONF_KEYS, out.split("\n")))
+        except Exception:
+            pass
+    return {k: (os.environ.get(k) or got.get(k) or "") for k in CONF_KEYS}
+
+
+CONF = conf()
+
+
+def notes_dir():
+    return os.path.expanduser(
+        CONF["AGENTDECK_NOTES_DIR"] or "~/.local/share/agent-deck-autopilot/sessions")
+
+
+def agent_deck():
+    return subprocess.run(
+        ["sh", "-c", "command -v agent-deck || echo /opt/homebrew/bin/agent-deck"],
+        capture_output=True, text=True).stdout.strip()
+
+
+AD = agent_deck()
+
+
+def rows(where="", args=()):
+    profile = CONF["AGENTDECK_PROFILE"] or "default"
+    db = os.path.expanduser(f"~/.agent-deck/profiles/{profile}/state.db")
+    try:
+        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+        sql = ("select id, title, group_path, status, worktree_branch, project_path "
+               f"from instances {where}")
+        return [dict(r) for r in con.execute(sql, args).fetchall()]
+    except sqlite3.Error:
+        return []
+
+
+def pairs(raw):
+    """"a=x;b=y" -> [("a", "x"), ("b", "y")], order preserved."""
+    out = []
+    for item in (raw or "").split(";"):
+        if "=" in item:
+            key, _, value = item.partition("=")
+            if key.strip():
+                out.append((key.strip(), value.strip()))
+    return out
+
+
+RULES = pairs(CONF["AGENTDECK_GROUP_RULES"])
+DESCRIPTIONS = pairs(CONF["AGENTDECK_GROUP_DESCRIPTIONS"])
+TICKET_GROUP = CONF["AGENTDECK_TICKET_GROUP"].strip()
+# Groups this tool is allowed to move sessions in and out of. Anything else is
+# a home you chose deliberately, so a session sitting in one is left where it is.
+MANAGED = [g for g, _ in RULES]
+MANAGED += [g for g, _ in DESCRIPTIONS if g not in MANAGED]
+if TICKET_GROUP and TICKET_GROUP not in MANAGED:
+    MANAGED.append(TICKET_GROUP)
+
+
+def existing_groups():
+    try:
+        out = subprocess.run([AD, "group", "list", "--json"],
+                             capture_output=True, text=True, timeout=15,
+                             env={**os.environ, "AGENTDECK_SUPPRESS_TMUX_WARNING": "1"})
+        data = json.loads(out.stdout or "{}")
+    except Exception:
+        return None
+    return {g.get("path", "") for g in data.get("groups", [])}
+
+
+def ticket_key(text):
+    prefix = CONF["AGENTDECK_TICKET_PREFIX"].strip()
+    pat = (rf"\b({re.escape(prefix)})-?(\d{{1,6}})\b" if prefix
+           else r"\b([A-Z][A-Z0-9]{1,9})-(\d{1,6})\b")
+    m = re.search(pat, text or "", re.I if prefix else 0)
+    return f"{m.group(1).upper()}-{m.group(2)}" if m else ""
+
+
+def note_of(instance_id):
+    path = os.path.join(notes_dir(), f"{instance_id}.md")
+    try:
+        with open(path) as fh:
+            return path, fh.read()
+    except OSError:
+        return path, ""
+
+
+def front_value(text, field):
+    m = re.search(rf"^{field}:\s*(.*)$", text.split("\n---", 1)[0], re.M)
+    return m.group(1).strip() if m else ""
+
+
+def opening(note):
+    """What the session was opened with.
+
+    Keyword rules read this and nothing else from the note. A session is
+    about what you started it for; everything after that wanders, and a reply
+    that happens to mention Rollbar is not a session about Rollbar. Matching
+    the whole trail files a delivery session under "people" because someone's
+    name came up in passing. The model fallback gets the full note instead —
+    it can tell a mention from a subject.
+    """
+    body = note.split("\n---", 1)[-1]
+    m = re.search(r"^## Opened with\s*\n\s*\n> (.*)$", body, re.M)
+    return m.group(1) if m else ""
+
+
+PROMPT = """Below is a record of a terminal coding session, and the groups a \
+deck of such sessions is filed into. Reply with exactly one group name from \
+the list — the one this session belongs in. If the record is too thin to tell, \
+or it fits none of them, reply with the single word: unknown
+No punctuation, no explanation, no preamble.
+
+--- groups ---
+%s
+--- session record ---
+%s
+--- end record ---"""
+
+
+def child_env():
+    """Environment for a `claude -p` child that must not be mistaken for you.
+
+    Agent Deck identifies the current session from tmux, and its own hooks run
+    in any Claude process. A child started inside a deck pane therefore gets
+    adopted by that deck session: its transcript is recorded as the session's,
+    and the next standing note is written from the classifier's conversation
+    rather than yours. Strip tmux from the environment and run somewhere else,
+    so nothing links the child back to the session that asked the question.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("TMUX", "TMUX_PANE") and not k.startswith("AGENTDECK_")}
+    env["AGENTDECK_AUTOPILOT_CHILD"] = "1"
+    return env
+
+
+def ask(model, taxonomy, body):
+    allowed = {g for g, _ in taxonomy}
+    listing = "\n".join(f"{g}: {d}" for g, d in taxonomy)
+    try:
+        out = subprocess.run(
+            ["claude", "-p", "--model", model, PROMPT % (listing, body)],
+            capture_output=True, text=True, timeout=120,
+            cwd=tempfile.gettempdir(), env=child_env())
+    except Exception:
+        return ""
+    if out.returncode != 0:
+        return ""
+    text = re.sub(r"[^\w/-]", "", (out.stdout or "").strip().split("\n")[0]).lower()
+    # A model that answered with anything but a group name has not answered.
+    return next((g for g in allowed if g.lower() == text), "")
+
+
+def classify(row, note, model, use_llm):
+    """(group, why). Empty group means: leave this session where it is."""
+    title = row.get("title") or ""
+    branch = row.get("worktree_branch") or ""
+    opened = opening(note)
+    text = f"{title} {branch} {opened}".lower()
+
+    # Title before prompt, and every rule against the title before any rule
+    # against the prompt. A title is a considered label for the session; the
+    # opening prompt is prose that mentions things in passing. "agent deck
+    # autopilot" is a session about the deck even when the prompt it opened
+    # with happens to say the word MCP.
+    for scope, where in ((f"{title} {branch}".lower(), "title"),
+                         (opened.lower(), "opening prompt")):
+        for group, rx in RULES:
+            try:
+                if re.search(rx, scope):
+                    return group, f"keyword rule on {where}"
+            except re.error:
+                continue
+
+    key = ticket_key(f"{title} {branch} {opened}")
+    if TICKET_GROUP and (key or "/deliver" in text):
+        return TICKET_GROUP, f"ticketed ({key})" if key else "ticketed (/deliver)"
+
+    if not use_llm or not DESCRIPTIONS:
+        return "", "no rule matched"
+    try:
+        min_turns = int(CONF["AGENTDECK_GROUP_MIN_TURNS"] or 2)
+    except ValueError:
+        min_turns = 2
+    turns = int(re.sub(r"\D", "", front_value(note, "turns") or "0") or 0)
+    if turns < min_turns:
+        return "", f"no rule matched; only {turns} turn(s), too thin to ask"
+    group = ask(model, DESCRIPTIONS, note.split("\n---", 1)[-1][:4000])
+    return (group, "model read the note") if group else ("", "no rule matched; model unsure")
+
+
+def stamp(path, group):
+    """Record the group we chose, in the note.
+
+    This is what tells a later run whether a session's group is still ours to
+    change. agent-deck-session-note preserves the field across rebuilds.
+    """
+    try:
+        with open(path) as fh:
+            text = fh.read()
+        text = re.sub(r"^auto_group:.*\n", "", text, flags=re.M)
+        text = text.replace("---\n", f"---\nauto_group: {group}\n", 1)
+        with open(path, "w") as fh:
+            fh.write(text)
+    except OSError:
+        pass
+
+
+def eligible(row, note, force):
+    current = row.get("group_path") or ""
+    marked = front_value(note, "auto_group")
+    if force:
+        return True, ""
+    if marked and marked != current:
+        return False, f"you moved it to '{current}' (autopilot left it in '{marked}')"
+    if not marked and current not in DEFAULT_GROUPS and current not in MANAGED:
+        return False, f"'{current}' is not a group autopilot manages"
+    return True, ""
+
+
+def process(row, model, force, dry, use_llm, groups):
+    label = f"{row['id'][:8]} '{row.get('title', '')}'"
+    path, note = note_of(row["id"])
+    if not note:
+        return f"skip {label}: no note yet"
+    ok, why = eligible(row, note, force)
+    if not ok:
+        return f"skip {label}: {why}"
+
+    target, why = classify(row, note, model, use_llm)
+    current = row.get("group_path") or ""
+    if not target:
+        return f"skip {label}: {why}"
+    if groups is not None and target not in groups:
+        return f"skip {label}: group '{target}' does not exist (agent-deck group create {target})"
+    if target == current:
+        if not dry and front_value(note, "auto_group") != target:
+            stamp(path, target)
+        return f"keep {label} in {current} ({why})"
+    if dry:
+        return f"would move {label}: {current or '(none)'} -> {target} ({why})"
+    out = subprocess.run([AD, "group", "move", row["id"], target],
+                         capture_output=True, text=True, timeout=20,
+                         env={**os.environ, "AGENTDECK_SUPPRESS_TMUX_WARNING": "1"})
+    if out.returncode != 0:
+        return f"FAILED {label} -> {target}: {(out.stderr or out.stdout).strip()[:120]}"
+    stamp(path, target)
+    return f"moved {label}: {current or '(none)'} -> {target} ({why})"
+
+
+def current_id():
+    if not os.environ.get("TMUX"):
+        return ""
+    try:
+        name = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        if not name.startswith("agentdeck_"):
+            return ""
+        cur = json.loads(subprocess.run([AD, "session", "current", "--json"],
+                                        capture_output=True, text=True, timeout=15,
+                                        env={**os.environ,
+                                             "AGENTDECK_SUPPRESS_TMUX_WARNING": "1"},
+                                        ).stdout or "{}")
+        return cur.get("id", "")
+    except Exception:
+        return ""
+
+
+def main():
+    args = sys.argv[1:]
+    if (CONF["AGENTDECK_AUTOGROUP"] or "1") == "0":
+        return 0
+    if not RULES and not DESCRIPTIONS and not TICKET_GROUP:
+        return 0
+    model = CONF["AGENTDECK_GROUP_MODEL"] or DEFAULT_MODEL
+    force, dry = "--force" in args, "--dry-run" in args
+    use_llm = "--no-llm" not in args
+    verbose = bool(set(args) & {"--all", "--instance", "--dry-run"})
+    groups = existing_groups()
+
+    if "--all" in args:
+        targets = rows("where archived_at = 0 and is_conductor = 0 and tool = 'claude'")
+    elif "--instance" in args:
+        targets = rows("where id like ?", (args[args.index("--instance") + 1] + "%",))
+    else:
+        sys.stdin.read()  # drain the hook payload; the registry is the source
+        sid = current_id()
+        targets = rows("where id = ?", (sid,)) if sid else []
+
+    for row in targets:
+        line = process(row, model, force, dry, use_llm, groups)
+        if verbose:
+            print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

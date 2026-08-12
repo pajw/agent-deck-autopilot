@@ -10,6 +10,7 @@ ln -sf "$REPO/bin/agent-deck-housekeeping" "$HOME/.local/bin/agent-deck-housekee
 ln -sf "$REPO/bin/agent-deck-session-note" "$HOME/.local/bin/agent-deck-session-note"
 ln -sf "$REPO/bin/agent-deck-rank" "$HOME/.local/bin/agent-deck-rank"
 ln -sf "$REPO/bin/agent-deck-name-session" "$HOME/.local/bin/agent-deck-name-session"
+ln -sf "$REPO/bin/agent-deck-group-session" "$HOME/.local/bin/agent-deck-group-session"
 [ -f "$HOME/.config/agent-deck-autopilot.conf" ] || cp "$REPO/config.example.conf" "$HOME/.config/agent-deck-autopilot.conf"
 
 plist="$HOME/Library/LaunchAgents/com.agent-deck-autopilot.housekeeping.plist"
@@ -27,7 +28,7 @@ Done. Two manual steps remain:
 
 2. Register two hooks in ~/.claude/settings.json.
 
-   hooks.UserPromptSubmit — names and groups the session:
+   hooks.UserPromptSubmit — names the session from its ticket:
 
    { "type": "command",
      "command": "~/.claude/hooks/agentdeck-auto-rename.sh",
@@ -35,14 +36,17 @@ Done. Two manual steps remain:
 
    hooks.Stop — keeps its standing note current, so a session that dies
    without a wrap-up still leaves a readable record, then titles unticketed
-   sessions from that note. Order matters: the namer reads what the note
-   writes.
+   sessions from that note and files it into a group. Order matters: both
+   the namer and the grouper read what the note writes.
 
    { "type": "command",
      "command": "~/.local/bin/agent-deck-session-note",
      "async": true, "timeout": 20 },
    { "type": "command",
      "command": "~/.local/bin/agent-deck-name-session",
+     "async": true, "timeout": 150 },
+   { "type": "command",
+     "command": "~/.local/bin/agent-deck-group-session",
      "async": true, "timeout": 150 }
 
 Dry-run the housekeeping any time, without touching a session:

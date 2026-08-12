@@ -33,6 +33,7 @@ import re
 import sqlite3
 import subprocess
 import sys
+import tempfile
 
 DEFAULT_MODEL = "claude-haiku-4-5-20251001"
 MAX_TITLE = 40
@@ -118,12 +119,28 @@ If the record is too thin to tell, reply with the single word: unknown
 --- end record ---"""
 
 
+def child_env():
+    """Environment for a `claude -p` child that must not be mistaken for you.
+
+    Agent Deck identifies the current session from tmux, and its own hooks run
+    in any Claude process. A child started inside a deck pane therefore gets
+    adopted by that deck session: its transcript is recorded as the session's,
+    and the next standing note is written from the namer's conversation rather
+    than yours. Strip tmux from the environment and run somewhere else, so
+    nothing links the child back to the session that asked the question.
+    """
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("TMUX", "TMUX_PANE") and not k.startswith("AGENTDECK_")}
+    env["AGENTDECK_AUTOPILOT_CHILD"] = "1"
+    return env
+
+
 def ask(model, body):
     try:
         out = subprocess.run(
             ["claude", "-p", "--model", model, PROMPT % body],
             capture_output=True, text=True, timeout=120,
-            env={**os.environ, "AGENTDECK_AUTOPILOT_CHILD": "1"})
+            cwd=tempfile.gettempdir(), env=child_env())
     except Exception:
         return ""
     if out.returncode != 0:
